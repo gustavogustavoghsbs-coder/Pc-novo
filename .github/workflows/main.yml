@@ -1,0 +1,149 @@
+nome: RDP
+
+sobre:
+  despacho de fluxo de trabalho:
+
+empregos:
+  rdp seguro:
+    executa em: windows-latest
+    tempo limite em minutos: 3600
+
+    passos:
+      - nome: Configurar RDP
+        shell: powershell
+        executar: |
+          $rdpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $tcpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+
+          Set-ItemProperty -Path $rdpPath -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name 'SecurityLayer' -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          se (Get-Service -Name TermService -ErrorAction SilentlyContinue) {
+              Reiniciar-Serviço -Nome TermService -Forçar
+          }
+
+      - nome: Criar usuário RDP
+        shell: powershell
+        executar: |
+          $username = "Skyro"
+
+          $upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.ToCharArray()
+          $lower = 'abcdefghijklmnopqrstuvwxyz'.ToCharArray()
+          $numbers = '0123456789'.ToCharArray()
+          $special = '!@#$%^&*()-_=+[]{}:,.?'.ToCharArray()
+
+          $passwordChars = @()
+          $passwordChars += $upper | Get-Random -Count 4
+          $passwordChars += $lower | Get-Random -Count 4
+          $passwordChars += $numbers | Get-Random -Count 4
+          $passwordChars += $special | Get-Random -Count 4
+
+          $senha = -join ($senhaChars | Sort-Object { Get-Random })
+          $senhaSegura = ConverterParaStringSegura $senha -ComoTextoSimples -Forçar
+
+          se (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Remover-UsuárioLocal -Nome $username
+          }
+
+          Novo-UsuárioLocal `
+            -Nome $username `
+            -Senha $senhaSegura
+            -ContaNuncaExpira
+            -A senhaNuncaExpira
+            -O usuário não pode alterar a senha
+
+          Adicionar-MembroDoGrupoLocal -Grupo "Administradores" -Membro $username -AçãoDeErro ContinuarSilenciosamente
+          Adicionar-MembroDoGrupoLocal -Grupo "Usuários da Área de Trabalho Remota" -Membro $username -AçãoDeErro ContinuarSilenciosamente
+
+          se (-não (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              exibir "Falha ao criar usuário RDP".
+          }
+
+          "RDP_CREDS=Usuário: $username | Senha: $password" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - nome: Instalar Tailscale
+        shell: powershell
+        executar: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          Iniciar-Processo msiexec.exe
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Espere
+
+          Remover-Item $installerPath -Forçar
+
+      - nome: Estabelecer conexão com a escama de cauda
+        shell: powershell
+        executar: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+
+          enquanto (-não $tsIP -e $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+              se (-não $tsIP) {
+                  Iniciar-Dormir -Segundos 5
+              }
+
+              $retentativas++
+          }
+
+          se (-não $tsIP) {
+              Erro de gravação: "IP do Tailscale não atribuído. Saindo."
+              saída 1
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - nome: Verificar acessibilidade RDP
+        shell: powershell
+        executar: |
+          $conectado = $falso
+
+          para ($i = 1; $i -le 6; $i++) {
+              $result = Test-NetConnection `
+                -NomeDoComputador $env:TAILSCALE_IP `
+                -Porta 3389
+                -AvisoAção Continuar Silenciosamente
+
+              se ($result.TcpTestSucceeded) {
+                  $conectado = $verdadeiro
+                  quebrar
+              }
+
+              Iniciar-Dormir -Segundos 5
+          }
+
+          se (-não $conectado) {
+              exibir "A porta RDP 3389 não está acessível."
+          }
+
+      - nome: Manter Conexão
+        shell: powershell
+        executar: |
+          Write-Host ""
+          Write-Host "====================================="
+          Write-Host "ACESSO RDP"
+          Write-Host "====================================="
+          Write-Host "Endereço: $env:TAILSCALE_IP"
+          Write-Host "Nome de usuário: Skyro"
+          Write-Host "Credenciais: $env:RDP_CREDS"
+          Write-Host "====================================="
+          Write-Host ""
+
+          enquanto ($verdadeiro) {
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Ativo"
+              Iniciar-Dormir -Segundos 300
+          }
